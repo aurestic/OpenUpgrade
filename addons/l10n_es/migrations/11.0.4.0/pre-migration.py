@@ -82,6 +82,16 @@ def _migrate_account_types(env):
             """,
             params,
         )
+        openupgrade.logged_query(
+            env.cr,
+            """
+                UPDATE account_account_template
+                SET user_type_id = %(new_id)s
+                WHERE user_type_id = %(old_id)s
+            """,
+            params,
+        )
+
     # Adjust related field according mappings. Actually, we keep the field
     # synced, no matter if changed here, but for the sake of simplicity
     openupgrade.logged_query(
