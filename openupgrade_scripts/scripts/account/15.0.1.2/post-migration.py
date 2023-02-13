@@ -28,6 +28,7 @@ def _fill_payment_destination_journal(env):
         SET destination_journal_id = aj.id
         FROM account_journal aj, account_move am
         WHERE aj.bank_account_id = ap.partner_bank_id AND ap.is_internal_transfer
+            AND aj.active
             AND ap.move_id = am.id AND am.state = 'posted'
             AND aj.type in ('bank', 'cash') AND aj.id != am.journal_id""",
     )
