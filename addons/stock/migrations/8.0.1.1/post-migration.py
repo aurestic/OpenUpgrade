@@ -627,6 +627,39 @@ def migrate_stock_warehouses(cr, registry):
         _migrate_stock_warehouse(cr, registry, wh[0])
 
 
+m2o_to_x2m = openupgrade.m2o_to_x2m
+
+
+def fix_m2o_to_x2m(cr, model, table, field, source_field):
+    try:
+        return m2o_to_x2m(cr, model, table, field, source_field)
+    except AttributeError:
+        try:
+            columns = model._fields
+        except AttributeError:
+            columns = model._columns
+        target_table = model.pool[columns[field].comodel_name]._table
+        target_field = columns[field].inverse_name
+        openupgrade.logged_query(
+            cr,
+            """
+            UPDATE %(target_table)s AS target
+            SET %(target_field)s=source.id
+            FROM %(source_table)s AS source
+            WHERE source.%(source_field)s=target.id
+            """
+            % {
+                "target_table": target_table,
+                "target_field": target_field,
+                "source_field": source_field,
+                "source_table": table,
+            },
+        )
+
+
+openupgrade.m2o_to_x2m = fix_m2o_to_x2m
+
+
 def migrate_stock_warehouse_orderpoint(cr):
     """procurement_id to procurement_ids
     :param cr: database cursor
