@@ -247,7 +247,7 @@ def fill_stock_picking_type_sequence_code(env):
     spt_seq_codes = []
     for picking_type in picking_types:
         prefix = picking_type.sequence_id.prefix
-        if picking_type.warehouse_id:
+        if picking_type.warehouse_id and prefix:
             groups = re.findall(r"(.*)\/(.*)\/", prefix)
             if groups and len(groups[0]) == 2:
                 spt_seq_codes += [(picking_type.id, groups[0][1])]

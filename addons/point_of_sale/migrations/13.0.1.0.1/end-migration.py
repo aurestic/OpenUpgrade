@@ -64,6 +64,7 @@ def create_pos_payment_methods(env):
 
 
 def create_pos_payments(env):
+    tmp_pos_config_payment_methods = {}
     env.cr.execute("""
         SELECT DISTINCT absl.id, ppm.id, absl.pos_statement_id,
             absl.name, absl.amount, absl.create_date
@@ -86,6 +87,14 @@ def create_pos_payments(env):
                 'payment_date': st_line[5],
             }
             vals_list += [vals]
+            # Hay clientes con métodos de pagos que ya no están permitidos
+            # los añadimos y posteriormente los eliminamos.
+            payment_method = env["pos.payment.method"].browse(st_line[1])
+            config = env["pos.order"].browse(st_line[2]).session_id.config_id
+            if payment_method not in config.payment_method_ids:
+                config.payment_method_ids |= payment_method
+                tmp_pos_config_payment_methods.setdefault(config, payment_method)
+                tmp_pos_config_payment_methods[config] |= payment_method
         env['pos.payment'].create(vals_list)
     # We need to delete all the lines from sessions not validated in order to not
     # disturb validation
@@ -106,6 +115,9 @@ def create_pos_payments(env):
     env["account.bank.statement"].search(
         [("pos_session_id.state", "!=", "closed")]
     )._end_balance()
+    # Borramos los métodos de pago que ya no están permitidos
+    for config, payment_methods in tmp_pos_config_payment_methods.items():
+        config.payment_method_ids -= payment_methods
 
 
 def fill_stock_warehouse_pos_type_id(env):

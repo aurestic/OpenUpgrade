@@ -1,0 +1,5 @@
+# Needed for OpenUpgrade
+odoorpc==0.7.0
+openupgradelib
+# PngStream' object has no attribute 'chunk_eXIf'
+Pillow==6.1.0
