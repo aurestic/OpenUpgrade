@@ -8,6 +8,7 @@ from openerp.tools.float_utils import float_round as round
 from openerp.tools import DEFAULT_SERVER_DATETIME_FORMAT
 from openerp.exceptions import UserError, ValidationError
 from openerp import api, fields, models, _
+from openerp.tools.safe_eval import safe_eval
 
 
 class AccountAccountType(models.Model):
@@ -528,7 +529,7 @@ class AccountTax(models.Model):
     type_tax_use = fields.Selection([('sale', 'Sales'), ('purchase', 'Purchases'), ('none', 'None')], string='Tax Scope', required=True, default="sale",
         help="Determines where the tax is selectable. Note : 'None' means a tax can't be used by itself, however it can still be used in a group.")
     amount_type = fields.Selection(default='percent', string="Tax Computation", required=True, oldname='type',
-        selection=[('group', 'Group of Taxes'), ('fixed', 'Fixed'), ('percent', 'Percentage of Price'), ('division', 'Percentage of Price Tax Included')])
+        selection=[('group', 'Group of Taxes'), ('fixed', 'Fixed'), ('percent', 'Percentage of Price'), ('division', 'Percentage of Price Tax Included'), ('code', 'Python Code')])
     active = fields.Boolean(default=True, help="Set active to false to hide the tax without removing it.")
     company_id = fields.Many2one('res.company', string='Company', required=True, default=lambda self: self.env.user.company_id)
     children_tax_ids = fields.Many2many('account.tax', 'account_tax_filiation_rel', 'parent_tax', 'child_tax', string='Children Taxes')
@@ -547,6 +548,21 @@ class AccountTax(models.Model):
     analytic = fields.Boolean(string="Include in Analytic Cost", help="If set, the amount computed by this tax will be assigned to the same analytic account as the invoice line (if any)")
     tag_ids = fields.Many2many('account.account.tag', 'account_tax_account_tag', string='Tags', help="Optional tags you may want to assign for custom reporting")
     tax_group_id = fields.Many2one('account.tax.group', string="Tax Group", default=_default_tax_group, required=True)
+    python_compute = fields.Text(string='Python Code', default="result = price_unit * 0.10",
+        help="Compute the amount of the tax by setting the variable 'result'.\n\n"
+            ":param base_amount: float, actual amount on which the tax is applied\n"
+            ":param price_unit: float\n"
+            ":param quantity: float\n"
+            ":param company: res.company recordset singleton\n"
+            ":param product: product.product recordset singleton or None\n"
+            ":param partner: res.partner recordset singleton or None")
+    python_applicable = fields.Text(string='Applicable Code', default="result = True",
+        help="Determine if the tax will be applied by setting the variable 'result' to True or False.\n\n"
+            ":param price_unit: float\n"
+            ":param quantity: float\n"
+            ":param company: res.company recordset singleton\n"
+            ":param product: product.product recordset singleton or None\n"
+            ":param partner: res.partner recordset singleton or None")
 
     _sql_constraints = [
         ('name_company_uniq', 'unique(name, company_id, type_tax_use)', 'Tax names must be unique !'),
@@ -650,6 +666,11 @@ class AccountTax(models.Model):
             return base_amount - (base_amount / (1 + self.amount / 100))
         if self.amount_type == 'division' and not self.price_include:
             return base_amount / (1 - self.amount / 100) - base_amount
+        if self.amount_type == 'code':
+            company = self.env.user.company_id
+            localdict = {'base_amount': base_amount, 'price_unit':price_unit, 'quantity': quantity, 'product':product, 'partner':partner, 'company': company}
+            safe_eval(self.python_compute, localdict, mode="exec", nocopy=True)
+            return localdict['result']
 
     @api.v8
     def compute_all(self, price_unit, currency=None, quantity=1.0, product=None, partner=None):
