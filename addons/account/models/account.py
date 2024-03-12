@@ -12,6 +12,7 @@ from odoo.tools import DEFAULT_SERVER_DATETIME_FORMAT, remove_accents
 from odoo.exceptions import UserError, ValidationError
 from odoo import api, fields, models, _, tools
 from odoo.tests.common import Form
+from odoo.tools.safe_eval import safe_eval
 
 TYPE_TAX_USE = [
     ('sale', 'Sales'),
@@ -804,7 +805,7 @@ class AccountJournal(models.Model):
     def _compute_alias_name(self):
         for record in self:
             record.alias_name = record.alias_id.alias_name
-            
+
     _inverse_alias_name = _inverse_type
 
     # do not depend on 'sequence_id.date_range_ids', because
@@ -962,8 +963,8 @@ class AccountJournal(models.Model):
     def _update_mail_alias(self, vals=None):
         if vals is not None:
             warnings.warn(
-                '`vals` is a deprecated argument of `_update_mail_alias`', 
-                DeprecationWarning, 
+                '`vals` is a deprecated argument of `_update_mail_alias`',
+                DeprecationWarning,
                 stacklevel=2
             )
 
@@ -1299,7 +1300,7 @@ class AccountTax(models.Model):
     type_tax_use = fields.Selection(TYPE_TAX_USE, string='Tax Scope', required=True, default="sale",
         help="Determines where the tax is selectable. Note : 'None' means a tax can't be used by itself, however it can still be used in a group. 'adjustment' is used to perform tax adjustment.")
     amount_type = fields.Selection(default='percent', string="Tax Computation", required=True,
-        selection=[('group', 'Group of Taxes'), ('fixed', 'Fixed'), ('percent', 'Percentage of Price'), ('division', 'Percentage of Price Tax Included')],
+        selection=[('group', 'Group of Taxes'), ('fixed', 'Fixed'), ('percent', 'Percentage of Price'), ('division', 'Percentage of Price Tax Included'),('code', 'Python Code')],
         help="""
     - Group of Taxes: The tax is a set of sub taxes.
     - Fixed: The tax amount stays the same whatever the price.
@@ -1340,6 +1341,21 @@ class AccountTax(models.Model):
     invoice_repartition_line_ids = fields.One2many(string="Repartition for Invoices", comodel_name="account.tax.repartition.line", inverse_name="invoice_tax_id", copy=True, help="Repartition when the tax is used on an invoice")
     refund_repartition_line_ids = fields.One2many(string="Repartition for Refund Invoices", comodel_name="account.tax.repartition.line", inverse_name="refund_tax_id", copy=True, help="Repartition when the tax is used on a refund")
     country_id = fields.Many2one(string='Country', comodel_name='res.country', related='company_id.country_id', help="Technical field used to restrict the domain of account tags for tax repartition lines created for this tax.")
+    python_compute = fields.Text(string='Python Code', default="result = price_unit * 0.10",
+        help="Compute the amount of the tax by setting the variable 'result'.\n\n"
+            ":param base_amount: float, actual amount on which the tax is applied\n"
+            ":param price_unit: float\n"
+            ":param quantity: float\n"
+            ":param company: res.company recordset singleton\n"
+            ":param product: product.product recordset singleton or None\n"
+            ":param partner: res.partner recordset singleton or None")
+    python_applicable = fields.Text(string='Applicable Code', default="result = True",
+        help="Determine if the tax will be applied by setting the variable 'result' to True or False.\n\n"
+            ":param price_unit: float\n"
+            ":param quantity: float\n"
+            ":param company: res.company recordset singleton\n"
+            ":param product: product.product recordset singleton or None\n"
+            ":param partner: res.partner recordset singleton or None")
 
     _sql_constraints = [
         ('name_company_uniq', 'unique(name, company_id, type_tax_use)', 'Tax names must be unique !'),
@@ -1527,6 +1543,13 @@ class AccountTax(models.Model):
         # <=> new_base * (1 - tax_amount) = base
         if self.amount_type == 'division' and price_include:
             return base_amount - (base_amount * (self.amount / 100))
+        if self.amount_type == 'code':
+            if product and product._name == 'product.template':
+                product = product.product_variant_id
+            company = self.env.company
+            localdict = {'base_amount': base_amount, 'price_unit':price_unit, 'quantity': quantity, 'product':product, 'partner':partner, 'company': company}
+            safe_eval(self.python_compute, localdict, mode="exec", nocopy=True)
+            return localdict['result']
 
     def json_friendly_compute_all(self, price_unit, currency_id=None, quantity=1.0, product_id=None, partner_id=None, is_refund=False):
         """ Called by the reconciliation to compute taxes on writeoff during bank reconciliation
