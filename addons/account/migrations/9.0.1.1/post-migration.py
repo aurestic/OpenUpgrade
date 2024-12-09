@@ -6,7 +6,8 @@
 
 import logging
 import operator
-import threading
+import multiprocessing
+import openerp
 from openupgradelib import openupgrade, openupgrade_90
 from psycopg2.extensions import AsIs
 
@@ -594,34 +595,41 @@ def fill_move_taxes(env, batch_size=100):
     )
     tax_code_ids = [row[0] for row in env.cr.fetchall()]
     deferred_base_tax_code_ids = []
-    def process_batch(batch):
+
+    def process_batch(batch, db_name, uid, context, queue):
+        # Create a new cursor for this process
+        db_env = openerp.api.Environment(
+            openerp.sql_db.db_connect(db_name).cursor(),
+            uid,
+            context,
+        )
         for tax_code_id in batch:
             # TAX AMOUNT
-            env.cr.execute(
+            db_env.cr.execute(
                 """SELECT COUNT(*), MAX(id) FROM account_tax
                 WHERE tax_code_id=%(tax_code_id)s
                 OR ref_tax_code_id=%(tax_code_id)s""",
                 {'tax_code_id': tax_code_id},
             )
-            row_tax = env.cr.fetchone()
+            row_tax = db_env.cr.fetchone()
             if row_tax[0] == 1:
                 openupgrade.logged_query(
-                    env.cr,
+                    db_env.cr,
                     """UPDATE account_move_line
                     SET tax_line_id = %s
                     WHERE tax_code_id = %s""", (row_tax[1], tax_code_id)
                 )
             elif row_tax[0] > 1:
                 # Try to match by tax name (put on the description of the line)
-                env.cr.execute(
+                db_env.cr.execute(
                     """SELECT name
                     FROM account_move_line
                     WHERE tax_code_id = %s
                     GROUP BY name""", (tax_code_id, )
                 )
-                for row_name in env.cr.fetchall():
+                for row_name in db_env.cr.fetchall():
                     # Look for a match also on translated terms
-                    env.cr.execute(
+                    db_env.cr.execute(
                         """SELECT COUNT(DISTINCT(t.id)), MAX(t.id)
                         FROM account_tax t
                         LEFT JOIN ir_translation tr
@@ -638,10 +646,10 @@ def fill_move_taxes(env, batch_size=100):
                             'name': row_name[0],
                         },
                     )
-                    row_tax = env.cr.fetchone()
+                    row_tax = db_env.cr.fetchone()
                     if row_tax[0] == 1:
                         openupgrade.logged_query(
-                            env.cr,
+                            db_env.cr,
                             """UPDATE account_move_line
                             SET tax_line_id = %s
                             WHERE tax_code_id = %s
@@ -649,50 +657,56 @@ def fill_move_taxes(env, batch_size=100):
                             """, (row_tax[1], tax_code_id, row_name[0])
                         )
             # BASE AMOUNT
-            env.cr.execute(
+            db_env.cr.execute(
                 """SELECT COUNT(*), MAX(id) FROM account_tax
                 WHERE base_code_id=%(tax_code_id)s OR
                 ref_base_code_id=%(tax_code_id)s
                 """, {'tax_code_id': tax_code_id},
             )
-            row_base = env.cr.fetchone()
+            row_base = db_env.cr.fetchone()
             if row_base[0] == 1:
-                env.cr.execute(
+                db_env.cr.execute(
                     """SELECT id, tax_amount
                     FROM account_move_line
                     WHERE tax_code_id=%s""", (tax_code_id,),
                 )
-                line_rows = env.cr.fetchall()
+                line_rows = db_env.cr.fetchall()
                 tax_amounts = dict(line_rows)
-                amls = env['account.move.line'].with_context(
+                amls = db_env['account.move.line'].with_context(
                     check_move_validity=False).browse(tax_amounts.keys())
-                _fill_aml_tax_line_ids(env, amls, row_base[1], tax_amounts)
+                _fill_aml_tax_line_ids(db_env, amls, row_base[1], tax_amounts)
             elif row_base[0] > 1:
-            # Let complete all the tax fee codes before doing the rest of the
-            # heuristics, as it depends on them
                 deferred_base_tax_code_ids.append(tax_code_id)
+        db_env.cr.commit()
+        db_env.cr.close()
+        queue.put(deferred_base_tax_code_ids)
 
-    def process_deferred_batch(batch):
+    def process_deferred_batch(batch, db_name, uid, context):
+        # Create a new cursor for this process
+        db_env = openerp.api.Environment(
+            openerp.sql_db.db_connect(db_name).cursor(),
+            uid,
+            context,
+        )
         for tax_code_id in batch:
-            env.cr.execute(
+            db_env.cr.execute(
                 """SELECT id, tax_amount
                 FROM account_move_line
                 WHERE tax_code_id=%s""", (tax_code_id, ),
             )
-            line_rows = env.cr.fetchall()
+            line_rows = db_env.cr.fetchall()
             tax_amounts = dict(line_rows)
-            amls = env['account.move.line'].browse(tax_amounts.keys())
-            # Match base tax using the already assigned tax fees
+            amls = db_env['account.move.line'].browse(tax_amounts.keys())
             matched = False
             for line in amls:
-                env.cr.execute(
+                db_env.cr.execute(
                     """SELECT tax_line_id
                     FROM account_move_line
                     WHERE move_id = %s""", (line.move_id.id, ),
                 )
-                fee_tax_ids = [x[0] for x in env.cr.fetchall() if x[0]]
+                fee_tax_ids = [x[0] for x in db_env.cr.fetchall() if x[0]]
                 if fee_tax_ids:
-                    env.cr.execute(
+                    db_env.cr.execute(
                         """SELECT COUNT(*), MAX(id) FROM account_tax
                         WHERE (
                            base_code_id=%(tax_code_id)s OR
@@ -703,13 +717,12 @@ def fill_move_taxes(env, batch_size=100):
                             'tax_ids': tuple(fee_tax_ids),
                         },
                     )
-                    row_base = env.cr.fetchone()
+                    row_base = db_env.cr.fetchone()
                     if row_base[0] == 1:
                         matched = True
-                    _fill_aml_tax_line_ids(env, line, row_base[1], tax_amounts)
+                        _fill_aml_tax_line_ids(db_env, line, row_base[1], tax_amounts)
             if not matched:
-                # Try with only active taxes
-                env.cr.execute(
+                db_env.cr.execute(
                     """SELECT COUNT(*), MAX(id) FROM account_tax
                     WHERE (
                         base_code_id=%(tax_code_id)s OR
@@ -717,26 +730,36 @@ def fill_move_taxes(env, batch_size=100):
                     ) AND active=True
                     """, {'tax_code_id': tax_code_id},
                 )
-                row_base = env.cr.fetchone()
+                row_base = db_env.cr.fetchone()
                 if row_base[0] == 1:
-                    _fill_aml_tax_line_ids(env, amls, row_base[1], tax_amounts)
+                    _fill_aml_tax_line_ids(db_env, amls, row_base[1], tax_amounts)
+        db_env.cr.commit()
+        db_env.cr.close()
 
+    env.cr.commit()
     # Split tax_code_ids into batches
     batches = [
         tax_code_ids[i:i + batch_size]
         for i in range(0, len(tax_code_ids), batch_size)
     ]
 
-    # Create and start threads for processing tax_code_ids
-    threads = []
-    for batch in batches:
-        thread = threading.Thread(target=process_batch, args=(batch,))
-        threads.append(thread)
-        thread.start()
+    # Create a queue to collect deferred_base_tax_code_ids
+    queue = multiprocessing.Queue()
 
-    # Wait for all threads to complete
-    for thread in threads:
-        thread.join()
+    # Create a pool of processes for processing tax_code_ids
+    with multiprocessing.Pool(processes=10) as pool:
+        pool.starmap(
+            process_batch,
+            [
+                (batch, env.cr.dbname, env.uid, env.context, queue)
+                for batch in batches
+            ],
+        )
+
+    # Collect deferred_base_tax_code_ids from the queue
+    deferred_base_tax_code_ids = []
+    while not queue.empty():
+        deferred_base_tax_code_ids.extend(queue.get())
 
     # Split deferred_base_tax_code_ids into batches
     deferred_batches = [
@@ -744,16 +767,15 @@ def fill_move_taxes(env, batch_size=100):
         for i in range(0, len(deferred_base_tax_code_ids), batch_size)
     ]
 
-    # Create and start threads for processing deferred_base_tax_code_ids
-    deferred_threads = []
-    for batch in deferred_batches:
-        thread = threading.Thread(target=process_deferred_batch, args=(batch,))
-        deferred_threads.append(thread)
-        thread.start()
-
-    # Wait for all deferred threads to complete
-    for thread in deferred_threads:
-        thread.join()
+    # Create a pool of processes for processing deferred_base_tax_code_ids
+    with multiprocessing.Pool(processes=10) as pool:
+        pool.starmap(
+            process_deferred_batch,
+            [
+                (batch, env.cr.dbname, env.uid, env.context)
+                for batch in deferred_batches
+            ],
+        )
 
 
 def fill_account_invoice_tax_taxes(env, manual_tax_code_mapping=None):
