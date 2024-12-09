@@ -6,6 +6,7 @@
 
 import logging
 import operator
+import threading
 from openupgradelib import openupgrade, openupgrade_90
 from psycopg2.extensions import AsIs
 
@@ -557,7 +558,7 @@ def _fill_aml_tax_line_ids(env, amls, tax_id, tax_amounts):
     lines_to_write.write({'tax_ids': [(4, tax_id)]})
 
 
-def fill_move_taxes(env):
+def fill_move_taxes(env, batch_size=100):
     """Try to deduce taxes in account move lines from old tax codes.
 
     Method followed:
@@ -591,131 +592,168 @@ def fill_move_taxes(env):
     env.cr.execute(
         "SELECT tax_code_id FROM account_move_line GROUP BY tax_code_id"
     )
+    tax_code_ids = [row[0] for row in env.cr.fetchall()]
     deferred_base_tax_code_ids = []
-    for row in env.cr.fetchall():
-        tax_code_id = row[0]
-        # TAX AMOUNT
-        env.cr.execute(
-            """SELECT COUNT(*), MAX(id) FROM account_tax
-            WHERE tax_code_id=%(tax_code_id)s
-            OR ref_tax_code_id=%(tax_code_id)s""",
-            {'tax_code_id': tax_code_id},
-        )
-        row_tax = env.cr.fetchone()
-        if row_tax[0] == 1:
-            openupgrade.logged_query(
-                env.cr,
-                """UPDATE account_move_line
-                SET tax_line_id = %s
-                WHERE tax_code_id = %s""", (row_tax[1], tax_code_id)
-            )
-        elif row_tax[0] > 1:
-            # Try to match by tax name (put on the description of the line)
-            env.cr.execute(
-                """SELECT name
-                FROM account_move_line
-                WHERE tax_code_id = %s
-                GROUP BY name""", (tax_code_id, )
-            )
-            for row_name in env.cr.fetchall():
-                # Look for a match also on translated terms
-                env.cr.execute(
-                    """SELECT COUNT(DISTINCT(t.id)), MAX(t.id)
-                    FROM account_tax t
-                    LEFT JOIN ir_translation tr
-                    ON tr.name='account.tax,name' AND tr.res_id = t.id
-                    WHERE (
-                        t.tax_code_id = %(tax_code_id)s OR
-                        t.ref_tax_code_id = %(tax_code_id)s
-                    )
-                    AND (
-                        t.name = %(name)s OR
-                        tr.value = %(name)s
-                    )""", {
-                        'tax_code_id': tax_code_id,
-                        'name': row_name[0],
-                    },
-                )
-                row_tax = env.cr.fetchone()
-                if row_tax[0] == 1:
-                    openupgrade.logged_query(
-                        env.cr,
-                        """UPDATE account_move_line
-                        SET tax_line_id = %s
-                        WHERE tax_code_id = %s
-                        AND name = %s
-                        """, (row_tax[1], tax_code_id, row_name[0])
-                    )
-        # BASE AMOUNT
-        env.cr.execute(
-            """SELECT COUNT(*), MAX(id) FROM account_tax
-            WHERE base_code_id=%(tax_code_id)s OR
-            ref_base_code_id=%(tax_code_id)s
-            """, {'tax_code_id': tax_code_id},
-        )
-        row_base = env.cr.fetchone()
-        if row_base[0] == 1:
-            env.cr.execute(
-                """SELECT id, tax_amount
-                FROM account_move_line
-                WHERE tax_code_id=%s""", (tax_code_id,),
-            )
-            line_rows = env.cr.fetchall()
-            tax_amounts = dict(line_rows)
-            amls = env['account.move.line'].with_context(
-                check_move_validity=False).browse(tax_amounts.keys())
-            _fill_aml_tax_line_ids(env, amls, row_base[1], tax_amounts)
-        elif row_base[0] > 1:
-            # Let complete all the tax fee codes before doing the rest of the
-            # heuristics, as it depends on them
-            deferred_base_tax_code_ids.append(tax_code_id)
-    for tax_code_id in deferred_base_tax_code_ids:
-        env.cr.execute(
-            """SELECT id, tax_amount
-            FROM account_move_line
-            WHERE tax_code_id=%s""", (tax_code_id, ),
-        )
-        line_rows = env.cr.fetchall()
-        tax_amounts = dict(line_rows)
-        amls = env['account.move.line'].browse(tax_amounts.keys())
-        # Match base tax using the already assigned tax fees
-        matched = False
-        for line in amls:
-            env.cr.execute(
-                """SELECT tax_line_id
-                FROM account_move_line
-                WHERE move_id = %s""", (line.move_id.id, ),
-            )
-            fee_tax_ids = [x[0] for x in env.cr.fetchall() if x[0]]
-            if fee_tax_ids:
-                env.cr.execute(
-                    """SELECT COUNT(*), MAX(id) FROM account_tax
-                    WHERE (
-                       base_code_id=%(tax_code_id)s OR
-                       ref_base_code_id=%(tax_code_id)s
-                    ) AND id IN %(tax_ids)s
-                    """, {
-                        'tax_code_id': tax_code_id,
-                        'tax_ids': tuple(fee_tax_ids),
-                    },
-                )
-                row_base = env.cr.fetchone()
-                if row_base[0] == 1:
-                    matched = True
-                    _fill_aml_tax_line_ids(env, line, row_base[1], tax_amounts)
-        if not matched:
-            # Try with only active taxes
+    def process_batch(batch):
+        for tax_code_id in batch:
+            # TAX AMOUNT
             env.cr.execute(
                 """SELECT COUNT(*), MAX(id) FROM account_tax
-                WHERE (
-                    base_code_id=%(tax_code_id)s OR
-                    ref_base_code_id=%(tax_code_id)s
-                ) AND active=True
+                WHERE tax_code_id=%(tax_code_id)s
+                OR ref_tax_code_id=%(tax_code_id)s""",
+                {'tax_code_id': tax_code_id},
+            )
+            row_tax = env.cr.fetchone()
+            if row_tax[0] == 1:
+                openupgrade.logged_query(
+                    env.cr,
+                    """UPDATE account_move_line
+                    SET tax_line_id = %s
+                    WHERE tax_code_id = %s""", (row_tax[1], tax_code_id)
+                )
+            elif row_tax[0] > 1:
+                # Try to match by tax name (put on the description of the line)
+                env.cr.execute(
+                    """SELECT name
+                    FROM account_move_line
+                    WHERE tax_code_id = %s
+                    GROUP BY name""", (tax_code_id, )
+                )
+                for row_name in env.cr.fetchall():
+                    # Look for a match also on translated terms
+                    env.cr.execute(
+                        """SELECT COUNT(DISTINCT(t.id)), MAX(t.id)
+                        FROM account_tax t
+                        LEFT JOIN ir_translation tr
+                        ON tr.name='account.tax,name' AND tr.res_id = t.id
+                        WHERE (
+                            t.tax_code_id = %(tax_code_id)s OR
+                            t.ref_tax_code_id = %(tax_code_id)s
+                        )
+                        AND (
+                            t.name = %(name)s OR
+                            tr.value = %(name)s
+                        )""", {
+                            'tax_code_id': tax_code_id,
+                            'name': row_name[0],
+                        },
+                    )
+                    row_tax = env.cr.fetchone()
+                    if row_tax[0] == 1:
+                        openupgrade.logged_query(
+                            env.cr,
+                            """UPDATE account_move_line
+                            SET tax_line_id = %s
+                            WHERE tax_code_id = %s
+                            AND name = %s
+                            """, (row_tax[1], tax_code_id, row_name[0])
+                        )
+            # BASE AMOUNT
+            env.cr.execute(
+                """SELECT COUNT(*), MAX(id) FROM account_tax
+                WHERE base_code_id=%(tax_code_id)s OR
+                ref_base_code_id=%(tax_code_id)s
                 """, {'tax_code_id': tax_code_id},
             )
             row_base = env.cr.fetchone()
             if row_base[0] == 1:
+                env.cr.execute(
+                    """SELECT id, tax_amount
+                    FROM account_move_line
+                    WHERE tax_code_id=%s""", (tax_code_id,),
+                )
+                line_rows = env.cr.fetchall()
+                tax_amounts = dict(line_rows)
+                amls = env['account.move.line'].with_context(
+                    check_move_validity=False).browse(tax_amounts.keys())
                 _fill_aml_tax_line_ids(env, amls, row_base[1], tax_amounts)
+            elif row_base[0] > 1:
+            # Let complete all the tax fee codes before doing the rest of the
+            # heuristics, as it depends on them
+                deferred_base_tax_code_ids.append(tax_code_id)
+
+    def process_deferred_batch(batch):
+        for tax_code_id in batch:
+            env.cr.execute(
+                """SELECT id, tax_amount
+                FROM account_move_line
+                WHERE tax_code_id=%s""", (tax_code_id, ),
+            )
+            line_rows = env.cr.fetchall()
+            tax_amounts = dict(line_rows)
+            amls = env['account.move.line'].browse(tax_amounts.keys())
+            # Match base tax using the already assigned tax fees
+            matched = False
+            for line in amls:
+                env.cr.execute(
+                    """SELECT tax_line_id
+                    FROM account_move_line
+                    WHERE move_id = %s""", (line.move_id.id, ),
+                )
+                fee_tax_ids = [x[0] for x in env.cr.fetchall() if x[0]]
+                if fee_tax_ids:
+                    env.cr.execute(
+                        """SELECT COUNT(*), MAX(id) FROM account_tax
+                        WHERE (
+                           base_code_id=%(tax_code_id)s OR
+                           ref_base_code_id=%(tax_code_id)s
+                        ) AND id IN %(tax_ids)s
+                        """, {
+                            'tax_code_id': tax_code_id,
+                            'tax_ids': tuple(fee_tax_ids),
+                        },
+                    )
+                    row_base = env.cr.fetchone()
+                    if row_base[0] == 1:
+                        matched = True
+                    _fill_aml_tax_line_ids(env, line, row_base[1], tax_amounts)
+            if not matched:
+                # Try with only active taxes
+                env.cr.execute(
+                    """SELECT COUNT(*), MAX(id) FROM account_tax
+                    WHERE (
+                        base_code_id=%(tax_code_id)s OR
+                        ref_base_code_id=%(tax_code_id)s
+                    ) AND active=True
+                    """, {'tax_code_id': tax_code_id},
+                )
+                row_base = env.cr.fetchone()
+                if row_base[0] == 1:
+                    _fill_aml_tax_line_ids(env, amls, row_base[1], tax_amounts)
+
+    # Split tax_code_ids into batches
+    batches = [
+        tax_code_ids[i:i + batch_size]
+        for i in range(0, len(tax_code_ids), batch_size)
+    ]
+
+    # Create and start threads for processing tax_code_ids
+    threads = []
+    for batch in batches:
+        thread = threading.Thread(target=process_batch, args=(batch,))
+        threads.append(thread)
+        thread.start()
+
+    # Wait for all threads to complete
+    for thread in threads:
+        thread.join()
+
+    # Split deferred_base_tax_code_ids into batches
+    deferred_batches = [
+        deferred_base_tax_code_ids[i:i + batch_size]
+        for i in range(0, len(deferred_base_tax_code_ids), batch_size)
+    ]
+
+    # Create and start threads for processing deferred_base_tax_code_ids
+    deferred_threads = []
+    for batch in deferred_batches:
+        thread = threading.Thread(target=process_deferred_batch, args=(batch,))
+        deferred_threads.append(thread)
+        thread.start()
+
+    # Wait for all deferred threads to complete
+    for thread in deferred_threads:
+        thread.join()
 
 
 def fill_account_invoice_tax_taxes(env, manual_tax_code_mapping=None):
