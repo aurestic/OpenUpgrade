@@ -248,6 +248,11 @@ def populate_fiscal_years(env):
             CROSS JOIN res_company rc
             WHERE drt.fiscal_year AND COALESCE(dr.company_id, drt.company_id) IS NULL"""
         )
+    openupgrade.logged_query(
+        env.cr,
+        "SELECT setval('account_fiscal_year_id_seq', "
+        "(SELECT MAX(id) FROM account_fiscal_year) + 1)"
+    )
 
 
 @openupgrade.migrate()
