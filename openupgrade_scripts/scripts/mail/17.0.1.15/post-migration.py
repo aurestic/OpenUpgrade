@@ -180,6 +180,6 @@ def migrate(env, version):
     _fill_res_company_alias_domain_id(env)
     _mail_alias_fill_alias_full_name(env)
     _mail_template_convert_report_template_m2o_to_m2m(env)
-    # _fill_mail_message_outgoing(env)
+    _fill_mail_message_outgoing(env)
     _mail_activity_plan_template(env)
     _handle_mail_template_multi_attachment(env)
