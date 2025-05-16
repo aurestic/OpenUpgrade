@@ -338,7 +338,6 @@ def post_statements(env):
     openupgrade.logger.debug(
         f"[post_statements] button_post {(len(stmt_ids))} statenments"
     )
-    env["account.bank.statement"].browse(stmt_ids).button_post()
     # calling .button_post() on all statements together fails with:
     # File "/odoo_env/src/odoo/addons/account/models/account_move.py", line 1842, in _check_unique_sequence_number  # noqa: B950
     #     raise ValidationError(_('Posted journal entry must have an unique sequence number per company.\n'  # noqa: B950
