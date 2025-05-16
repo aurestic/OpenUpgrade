@@ -406,7 +406,7 @@ def fill_company_account_journal_suspense_account_id(env):
         """
             UPDATE account_journal
             SET suspense_account_id = default_account_id
-        """
+        """,
     )
 
 
@@ -867,7 +867,9 @@ def migrate(env, version):
     fill_company_account_journal_suspense_account_id(env)
     openupgrade.logger.debug("[START] fill_statement_lines_with_no_move")
     fill_statement_lines_with_no_move(env)
-    openupgrade.logger.debug("[START] fill_account_journal_payment_credit_debit_account_id")
+    openupgrade.logger.debug(
+        "[START] fill_account_journal_payment_credit_debit_account_id"
+    )
     fill_account_journal_payment_credit_debit_account_id(env)
     openupgrade.logger.debug("[START] create_new_counterpart_account_payment_transfer")
     create_new_counterpart_account_payment_transfer(env)
