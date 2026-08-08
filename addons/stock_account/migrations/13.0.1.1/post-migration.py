@@ -196,7 +196,13 @@ def generate_stock_valuation_layer(env):
     precision_uom = env["decimal.precision"].precision_get(
         "Product Unit of Measure"
     )
-    companies = company_obj.search([])
+    skip_company_ids_raw = env["ir.config_parameter"].sudo().get_param("migration.skip_svl_company_ids", "").strip()
+    company_domain = []
+    if skip_company_ids_raw:
+        skip_company_ids = [int(x) for x in skip_company_ids_raw.split(",") if x.strip()]
+        _logger.info("migration.skip_svl_company_ids set, excluding company ids %s from svl generation", skip_company_ids)
+        company_domain = [("id", "not in", skip_company_ids)]
+    companies = company_obj.search(company_domain)
     products = product_obj.with_context(active_test=False).search([("type", "in", ("product", "consu"))])
     all_svl_list = []
     for company in companies:
