@@ -113,10 +113,22 @@ def create_pos_picking_types(env):
             "company_id": config.company_id.id,
             "default_location_src_id": location_id,
         }
-        if (
-            config.picking_type_id.sequence_id
-            and config.picking_type_id.sequence_id.company_id != config.company_id
-        ):
+        if not config.picking_type_id.sequence_id:
+            # La secuencia original ya no existe (p.ej. borrada por
+            # delete_records_safely_by_xml_id de mas arriba, caso de varias
+            # pos.config compartiendo la misma secuencia global). Si se deja
+            # sin "sequence_id" en vals, el create() de stock.picking.type
+            # crea una de repuesto con la compania del usuario actual
+            # (env.company), no la de vals["company_id"], provocando un
+            # _check_company() incompatible. Se crea aqui explicitamente con
+            # la compania correcta.
+            picking_type_seq = env["ir.sequence"].create({
+                "name": f"{config.picking_type_id.name} {config.name}",
+                "padding": 5,
+                "company_id": config.company_id.id,
+            })
+            vals["sequence_id"] = picking_type_seq.id
+        elif config.picking_type_id.sequence_id.company_id != config.company_id:
             picking_type_seq = config.picking_type_id.sequence_id.copy(
                 {
                     "company_id": config.company_id.id
